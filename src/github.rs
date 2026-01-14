@@ -1,9 +1,11 @@
 #![allow(unused)]
+use fuser::FUSE_ROOT_ID;
+use std::sync::atomic::{AtomicU64, Ordering};
 use reqwest::{Client, header};
 use serde_json::{Value, json};
 use serde::{Serialize, Deserialize};
 use base64::{engine::general_purpose, prelude::*};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -17,6 +19,9 @@ pub struct Files {
     pub file: String,
     pub api: String,
     pub sha: String,
+    pub size: u64,
+    pub ino: u64,
+    pub sync: bool,          // if created and not synced with github database
 }
 
 pub struct Github {
@@ -27,19 +32,16 @@ pub struct Github {
     pub email: String,
 }
 
-#[derive(Deserialize)]
-struct BlobResponse {
-    content: String,
-    encoding: String
-}
 /*
  * TODO: Remove all unwrap and use expect
  * */
 
+static CURRENT_INO: AtomicU64 = AtomicU64::new(FUSE_ROOT_ID + 1);
+
 impl Github {
-    pub fn new(token: &str, user_agent: &str, username: &str) -> Github {
+    pub fn new(token: &str, username: &str) -> Github {
         let name: String = String::from("cloudserver-id"); // add name
-            let email: String = String::from("suckitlilbros@outlook.com"); // add email (same as that of account)
+        let email: String = String::from("suckitlilbros@outlook.com"); // add email (same as that of account)
 
         let mut headers = header::HeaderMap::new();
 
@@ -50,7 +52,9 @@ impl Github {
 
         headers.insert(
             header::USER_AGENT,
-            user_agent.parse().unwrap()
+            "Mozilla/5.0 (Linux; Android 16; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.12.45 Mobile Safari/537.36"
+                .parse()
+                .unwrap()
         );
 
         headers.insert(
@@ -63,7 +67,13 @@ impl Github {
             .build()
             .unwrap();
 
-        Github { username: username.to_string(), client: client , cache: None, name, email }
+        Github {
+            username: username.to_string(),
+            client: client,
+            cache: None,
+            name: name,
+            email: email
+        }
     }
 
     pub async fn get_repos(&self) -> Vec<Repos> {
@@ -115,7 +125,16 @@ impl Github {
                         self.username, repo, name
                     );
                 let sha = file.get("sha").and_then(|x| x.as_str()).unwrap().to_string();
-                files.push(Files { file: name, api: url , sha });
+                let size = file.get("size").and_then(|x| Some(x.as_u64().expect("Error parsing"))).expect("Error parsing!");
+                files.push(Files {
+                    file: name,
+                    api: url,
+                    sha: sha,
+                    size: size,
+                    ino: CURRENT_INO.load(Ordering::SeqCst),
+                    sync: true,
+                });
+                CURRENT_INO.fetch_add(1, Ordering::SeqCst);
             }
         }
 
@@ -298,7 +317,10 @@ impl Github {
                 let file = Files {
                     file: file_name.to_string(),
                     api: download_file,
-                    sha: sha_file
+                    sha: sha_file,
+                    size: content.len() as u64,
+                    ino: CURRENT_INO.load(Ordering::SeqCst),
+                    sync: false
                 };
 
                 files_in_r.push(file);
@@ -435,6 +457,109 @@ impl Github {
         }
 
         dec_data
+    }
+
+    pub fn get_file(&self, file_name: &str) -> Option<Files> {
+        self.cache.as_ref().map_or(None, |cache| {
+            for (repo, files) in cache {
+                for file in files {
+                    if file.file == file_name {
+                        return Some(file.clone());
+                    }
+                }
+            }
+            return None;
+        })
+    }
+}
+
+pub enum FileType {
+    File(Files),
+    Dir(HashMap<String, u64>)
+}
+
+pub struct Node {
+    pub ino: u64,
+    pub name: String,
+    pub kind: FileType,
+    pub parent: u64,
+}
+
+pub struct FileTree {
+    pub nodes: HashMap<u64, Node>,
+    pub root: u64,
+    pub next_ino: u64,
+}
+
+impl FileTree {
+    pub fn new(files: Vec<Files>) -> Self {
+        let mut fs = FileTree {
+            nodes: HashMap::new(),
+            root: FUSE_ROOT_ID,
+            next_ino: FUSE_ROOT_ID + 1,
+        };
+
+        fs.nodes.insert(FUSE_ROOT_ID, Node {
+            ino: FUSE_ROOT_ID,
+            name: "/".into(),
+            kind: FileType::Dir(HashMap::new()),
+            parent: FUSE_ROOT_ID
+        });
+
+        for file in files {
+            fs.insert_path(file);
+        }
+
+        fs
+    }
+
+    fn alloc_ino(&mut self) -> u64 {
+        let ino = self.next_ino;
+        self.next_ino += 1;
+        ino
+    }
+
+    pub fn insert_path(&mut self, file: Files) {
+        let mut current = self.root;
+        let path = &file.file;
+
+        let parts: Vec<&str> = path.split("/").collect();
+
+        for (i, part) in parts.iter().enumerate() {
+            let is_last = i == parts.len() - 1;
+
+            let next = match &self.nodes[&current].kind {
+                FileType::Dir(children) => children.get(*part).copied(),
+                _ => unreachable!()
+            };
+
+            current = match next {
+                Some(ino) => ino,
+                None => {
+                    let ino = self.alloc_ino();
+
+                    let node = Node {
+                        ino,
+                        name: part.to_string(),
+                        parent: current,
+                        kind: if is_last {
+                            FileType::File(file.clone())
+                        } else {
+                            FileType::Dir(HashMap::new())
+                        },
+                    };
+
+                    if let FileType::Dir(children) =
+                        &mut self.nodes.get_mut(&current).unwrap().kind
+                    {
+                        children.insert(part.to_string(), ino);
+                    }
+
+                    self.nodes.insert(ino, node);
+                    ino
+                }
+            };
+        }
     }
 }
 
