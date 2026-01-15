@@ -1,5 +1,6 @@
 #![allow(unused)]
 use fuser::FUSE_ROOT_ID;
+use tokio::runtime::Handle;
 use std::sync::atomic::{AtomicU64, Ordering};
 use reqwest::{Client, header};
 use serde_json::{Value, json};
@@ -21,6 +22,7 @@ pub struct Files {
     pub sha: String,
     pub size: u64,
     pub ino: u64,
+    pub data: Vec<u8>,
     pub sync: bool,          // if created and not synced with github database
 }
 
@@ -132,6 +134,7 @@ impl Github {
                     sha: sha,
                     size: size,
                     ino: CURRENT_INO.load(Ordering::SeqCst),
+                    data: Vec::new(),
                     sync: true,
                 });
                 CURRENT_INO.fetch_add(1, Ordering::SeqCst);
@@ -320,6 +323,7 @@ impl Github {
                     sha: sha_file,
                     size: content.len() as u64,
                     ino: CURRENT_INO.load(Ordering::SeqCst),
+                    data: Vec::new(),
                     sync: false
                 };
 
@@ -427,7 +431,6 @@ impl Github {
         let mut found_files = Vec::new();
 
         if let Some(data) = &self.cache {
-            dbg!(&data);
             for (_, files) in data {
                 for file in files {
                     if file.file.starts_with(file_name) {
@@ -440,20 +443,26 @@ impl Github {
         found_files
     }
 
-    pub async fn download_file(&self, file_name: &str) -> Vec<u8> {
+    pub async fn download_file(&mut self, file_name: &str) -> Vec<u8> {
         let files_to_download = self.find_file(file_name);
-        dbg!(&files_to_download);
         let mut dec_data = Vec::new();
 
-        for file in files_to_download {
-            let body = self.client
-                .get(file.api)
-                .send()
-                .await.unwrap()
-                .text()
-                .await.unwrap();
+        for mut file in files_to_download {
+            if file.data.is_empty() {
+                let body = self.client
+                    .get(file.api)
+                    .send()
+                    .await.unwrap()
+                    .text()
+                    .await.unwrap();
 
-            dec_data.extend_from_slice(body.as_bytes());
+                let data = body.as_bytes();
+
+                file.data.extend_from_slice(data);
+                dec_data.extend_from_slice(data);
+            } else {
+                dec_data.extend_from_slice(&file.data);
+            }
         }
 
         dec_data
@@ -489,14 +498,18 @@ pub struct FileTree {
     pub nodes: HashMap<u64, Node>,
     pub root: u64,
     pub next_ino: u64,
+    pub github: Option<Github>,
+    pub handle: Handle
 }
 
 impl FileTree {
-    pub fn new(files: Vec<Files>) -> Self {
+    pub fn new(files: Vec<Files>, handle: Handle) -> Self {
         let mut fs = FileTree {
             nodes: HashMap::new(),
             root: FUSE_ROOT_ID,
             next_ino: FUSE_ROOT_ID + 1,
+            github: None,
+            handle: handle
         };
 
         fs.nodes.insert(FUSE_ROOT_ID, Node {
