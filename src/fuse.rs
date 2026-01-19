@@ -4,7 +4,6 @@ use fuser::{
 };
 use libc::ENOENT;
 use std::time::{Duration, SystemTime};
-use tokio::runtime::Handle;
 use std::ffi::OsStr;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -125,9 +124,7 @@ impl Filesystem for FileTree {
         };
 
         let data = self.handle.block_on(
-            self.github.as_mut()
-                .expect("[!] Error: not github set idk")
-                .download_file(&file.file)
+            // function returns the name of file
         );
 
         let offset = offset as usize;

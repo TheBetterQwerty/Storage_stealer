@@ -9,15 +9,23 @@ use base64::{engine::general_purpose, prelude::*};
 use std::collections::{HashMap, HashSet};
 use std::io::Result;
 
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Repos {
+pub struct Repo {
     pub name: String,
     pub size: u64,
+    pub filled: RepoStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Files {
-    pub file: String,
+pub enum RepoStatus {
+    Active(u64),
+    Sealed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct File {
+    pub name: String,
     pub api: String,
     pub sha: String,
     pub size: u64,
@@ -29,16 +37,14 @@ pub struct Files {
 pub struct Github {
     pub username: String,
     pub client: Client,
-    pub cache: Option<HashMap<Repos, Vec<Files>>>,
+    pub cache: Option<HashMap<Repo, Vec<File>>>,
     pub name: String,
     pub email: String,
 }
 
-/*
- * TODO: Remove all unwrap and use expect
- * */
-
 static CURRENT_INO: AtomicU64 = AtomicU64::new(FUSE_ROOT_ID + 1);
+const REPO_SIZE_LIMIT: u64 = 100 * 1024; // in KB
+const FILE_SIZE_LIMIT: u64 = 0; // in KB
 
 impl Github {
     pub fn new(token: &str, username: &str) -> Github {
@@ -78,7 +84,7 @@ impl Github {
         }
     }
 
-    pub async fn get_repos(&self) -> Vec<Repos> {
+    pub async fn get_repos(&self) -> Vec<Repo> {
         let api = "https://api.github.com/user/repos?visibility=all&sort=created&direction=asc";
 
         let body = self.client
@@ -89,18 +95,22 @@ impl Github {
             .await.unwrap();
 
         let json: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        let mut found_repos: Vec<Repos> = Vec::new();
+        let mut found_repos: Vec<Repo> = Vec::new();
 
         for repo in json {
             let name = repo.get("name").unwrap().to_string().trim_matches('"').to_string();
             let size = repo["size"].as_u64().unwrap_or(0);
-            found_repos.push(Repos { name, size });
+            found_repos.push(Repo {
+                name: name,
+                size: size,
+                filled: if size >= REPO_SIZE_LIMIT { RepoStatus::Sealed } else { RepoStatus::Active(REPO_SIZE_LIMIT - size) } // size left
+            });
         }
 
         found_repos
     }
 
-    pub async fn files_in_repo(&self, repo: &str, branch: Option<&str>) -> Vec<Files> {
+    pub async fn files_in_repo(&self, repo: &str, branch: Option<&str>) -> Vec<File> {
         let api: String = format!(
             "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
             self.username,
@@ -117,7 +127,7 @@ impl Github {
 
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let tree = json["tree"].as_array().unwrap();
-        let mut files: Vec<Files> = Vec::new();
+        let mut files: Vec<File> = Vec::new();
 
         for file in tree {
             if file.get("type").and_then(|v| v.as_str()) == Some("blob") {
@@ -128,8 +138,8 @@ impl Github {
                     );
                 let sha = file.get("sha").and_then(|x| x.as_str()).unwrap().to_string();
                 let size = file.get("size").and_then(|x| Some(x.as_u64().expect("Error parsing"))).expect("Error parsing!");
-                files.push(Files {
-                    file: name,
+                files.push(File {
+                    name: name,
                     api: url,
                     sha: sha,
                     size: size,
@@ -145,7 +155,6 @@ impl Github {
     }
 
     pub async fn cache_files(&mut self) -> Result<()> {
-        // call on mount
         let repos = self.get_repos().await;
         let mut cache = HashMap::new();
 
@@ -159,7 +168,7 @@ impl Github {
         Ok(())
     }
 
-    pub async fn create_repo(&mut self, repo: &str) -> Option<Repos> {
+    pub async fn create_repo(&mut self, repo: &str) -> Option<Repo> {
         let body = json!({
             "name" : repo,
             "description" : "",
@@ -176,18 +185,19 @@ impl Github {
 
 
         if !resp.status().is_success() {
-            eprintln!("API Error: {}: {:?}", resp.status(), resp.text().await.unwrap());
-            return None;
+            eprintln!("API Error: {}: {:?}", resp.status(), resp.text().await.unwrap()); return None;
         }
 
         let resp_json = serde_json::from_str::<serde_json::Value>(&resp.text().await.unwrap()).unwrap();
-
-        let repo = Repos {
-            name: repo.to_string(),
-            size: resp_json
+        let repo_size = resp_json
                 .get("size")
                 .and_then(|v| v.as_u64())
-                .expect("'size' key missing!")
+                .expect("'size' key missing!");
+
+        let repo = Repo {
+            name: repo.to_string(),
+            size: repo_size,
+            filled: if repo_size >= REPO_SIZE_LIMIT { RepoStatus::Sealed } else { RepoStatus::Active(REPO_SIZE_LIMIT - repo_size) },
         };
 
         self.cache.as_mut().unwrap().insert(
@@ -198,292 +208,23 @@ impl Github {
         Some(repo)
     }
 
-    pub async fn update_file_content(&mut self, old_file: &str, content: &str) -> bool {
-        let mut file = None;
-        let mut repo = None;
-        // handle if the file is split
-        if let Some(cache) = self.cache.as_mut() {
-            for (_repo, files) in cache.iter_mut() {
-                for _file in files.iter_mut() {
-                    if !_file.file.eq(old_file) {
-                        continue;
-                    }
-                    repo = Some(_repo);
-                    file = Some(_file);
-                }
-            }
-        }
-
-        if let None = file {
-            println!("[!] Error: File not found!\n");
-            return false;
-        }
-
-        let file = file.unwrap(); // safe unwraping
-        let repo = repo.unwrap(); // safe unwraping
-
-        let api = format!("https://api.github.com/repos/{}/{}/contents/{}", self.username, repo.name, file.file);
-
-        let body = json!({
-            "message" : format!("Updating file {}", file.file),
-            "committer" : {
-                "name" : self.name,
-                "email" : self.email
-            },
-            "content" : general_purpose::STANDARD.encode(content),
-            "sha" : file.sha
-        });
-
-        let resp = self.client
-            .put(api)
-            .json(&body)
-            .send()
-            .await.expect("Error sending request");
-
-        if !resp.status().is_success() {
-            eprintln!("API Error: {}: {}", resp.status(), resp.text().await.unwrap());
-            return false;
-        }
-
-        let resp_json = serde_json::from_str::<serde_json::Value>(&resp
-            .text()
-            .await
-            .expect("[!] Error: getting text from response")
-        ).expect("[!] Error: Deserializing");
-
-        dbg!(&resp_json);
-
-        let sha_file = resp_json["content"]["sha"]
-            .to_string()
-            .trim_matches('"')
-            .to_string();
-
-
-        file.sha.push_str(&sha_file);
-
-        true
+    pub async fn delete_file(&mut self, file: &str) -> bool {
+        false
     }
 
-    pub async fn rename_file(&self) {} // later
-
-    async fn upload_file_content(&mut self, api: &str, file_name: &str, content: &str, repo: &Repos) -> bool {
-
-        let body = json!({
-            "message" : format!("Uploading {}", file_name),
-            "committer" : {
-                "name" : self.name,
-                "email" : self.email
-            },
-            "content" : content,
-            "branch" : "main" // to avoid problems
-        });
-
-        let resp = self.client
-            .put(api)
-            .json(&body)
-            .send()
-            .await.unwrap();
-
-        if !resp.status().is_success() {
-            eprintln!("API Error: {}: {}", resp.status(), resp.text().await.unwrap());
-            return false;
-        }
-
-        let resp_json = serde_json::from_str::<serde_json::Value>(&resp
-            .text()
-            .await
-            .expect("[!] Error: getting text from response")
-        ).expect("[!] Error: Deserializing");
-
-
-        let sha_file = resp_json["content"]["sha"]
-            .as_str()
-            .expect("[!] Error: No key named 'sha'")
-            .to_string();
-
-        let download_file = resp_json["content"]["download_url"]
-            .as_str()
-            .expect("[!] Error: No key named 'content' 'download_url'")
-            .to_string();
-
-        // update the file data
-        if let Some(cache) = self.cache.as_mut() {
-            if let Some(files_in_r) = cache.get_mut(repo) {
-                for file in files_in_r.iter_mut() {
-                    if !file.file.eq(file_name) {
-                        continue;
-                    }
-                    file.sha.push_str(&sha_file);
-                    return true;
-                }
-
-                let file = Files {
-                    file: file_name.to_string(),
-                    api: download_file,
-                    sha: sha_file,
-                    size: content.len() as u64,
-                    ino: CURRENT_INO.load(Ordering::SeqCst),
-                    data: Vec::new(),
-                    sync: false
-                };
-
-                files_in_r.push(file);
-            }
-        }
-
-        true
+    pub async fn upload_file(&mut self, old_file: Option<File>, content: &str) -> bool {
+        // if old_file is none then is just wants to create a file
+        false
     }
 
-    pub async fn upload_file(&mut self, file: &str) -> bool {
-        let data: Vec<u8> = read_file(file);
-        let repositories = self.get_repos().await;
-
-        let repo_name = repositories
-            .iter()
-            .filter(|r| r.size + (data.len() as u64 / 1024) < 1_048_576)
-            .min_by_key(|r| r.size)
-            .map(|r| r.clone());
-
-        let (api, final_repo) = match repo_name {
-            Some(repo) => {
-                let api = format!(
-                    "https://api.github.com/repos/{}/{}/contents",
-                    self.username, repo.name
-                );
-
-                (api, repo)
-            },
-            None => {
-                let repo_name_new = if let Some(last_repo) = repositories.last() {
-                    let number: i32 = last_repo.name
-                        .split("_")
-                        .nth(1)
-                        .expect("repo doesn't contain '_'")
-                        .parse()
-                        .expect("Failed to parse repo number!");
-
-                    format!("repo_{}", number + 1)
-                } else {
-                    "repo_1".to_string()
-                };
-
-                let new_repo = self.create_repo(&repo_name_new).await;
-
-                if let None = new_repo {
-                    eprintln!("[!] Error creating {}", repo_name_new);
-                    return false;
-                }
-
-                let new_repo = new_repo.unwrap();
-
-                let api = format!(
-                    "https://api.github.com/repos/{}/{}/contents",
-                    self.username, new_repo.name
-                );
-
-                (api, new_repo)
-            }
-        };
-
-        let file = file
-            .split("/")
-            .last()
-            .expect("Error not found other part");
-
-        if data.len() > (100 * 1024 * 1024) { // 100mb
-            // chunck the data
-            let chunked_data: Vec<Vec<u8>> = data
-                .chunks(75 * 1024 * 1024) // 75mb -> encoded increases size
-                .map(|c| c.to_vec())
-                .collect();
-
-            for (idx, chunk) in chunked_data.iter().enumerate() {
-                if !self.upload_file_content(
-                    &format!("{}/{}/chunk_{}", api, file, idx + 1),
-                    &format!("{}.chunk_{}", file, idx + 1),
-                    &general_purpose::STANDARD.encode(chunk),
-                    &final_repo
-                ).await {
-                    eprintln!("[!] Error: Uploading {}", file);
-                    return false;
-                }
-            }
-
-            return true;
-
-        } else {
-            if !self.upload_file_content(
-                &format!("{}/{}", api, file),
-                file,
-                &general_purpose::STANDARD.encode(data),
-                &final_repo
-            ).await {
-                eprintln!("[!] Error: Uploading {}", file);
-                return false;
-            }
-
-            return true;
-        }
+    pub async fn download_file(&self, file: &str) -> String {
+        "".to_string()
     }
 
-    fn find_file(&self, file_name: &str) -> Vec<Files> {
-        // loops inside the caches values vectors and finds the file
-        let mut found_files = Vec::new();
-
-        if let Some(data) = &self.cache {
-            for (_, files) in data {
-                for file in files {
-                    if file.file.starts_with(file_name) {
-                        found_files.push(file.clone());
-                    }
-                }
-            }
-        }
-
-        found_files
-    }
-
-    pub async fn download_file(&mut self, file_name: &str) -> Vec<u8> {
-        let files_to_download = self.find_file(file_name);
-        let mut dec_data = Vec::new();
-
-        for mut file in files_to_download {
-            if file.data.is_empty() {
-                let body = self.client
-                    .get(file.api)
-                    .send()
-                    .await.unwrap()
-                    .text()
-                    .await.unwrap();
-
-                let data = body.as_bytes();
-
-                file.data.extend_from_slice(data);
-                dec_data.extend_from_slice(data);
-            } else {
-                dec_data.extend_from_slice(&file.data);
-            }
-        }
-
-        dec_data
-    }
-
-    pub fn get_file(&self, file_name: &str) -> Option<Files> {
-        self.cache.as_ref().map_or(None, |cache| {
-            for (repo, files) in cache {
-                for file in files {
-                    if file.file == file_name {
-                        return Some(file.clone());
-                    }
-                }
-            }
-            return None;
-        })
-    }
 }
 
 pub enum FileType {
-    File(Files),
+    File(File),
     Dir(HashMap<String, u64>)
 }
 
@@ -503,7 +244,7 @@ pub struct FileTree {
 }
 
 impl FileTree {
-    pub fn new(files: Vec<Files>, handle: Handle) -> Self {
+    pub fn new(files: Vec<File>, handle: Handle) -> Self {
         let mut fs = FileTree {
             nodes: HashMap::new(),
             root: FUSE_ROOT_ID,
@@ -532,9 +273,9 @@ impl FileTree {
         ino
     }
 
-    pub fn insert_path(&mut self, file: Files) {
+    pub fn insert_path(&mut self, file: File) {
         let mut current = self.root;
-        let path = &file.file;
+        let path = &file.name;
 
         let parts: Vec<&str> = path.split("/").collect();
 
