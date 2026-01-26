@@ -1,7 +1,10 @@
 #![allow(unused)]
 use fuser::FUSE_ROOT_ID;
+use std::io::{Error, IsTerminal, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use tokio::runtime::Handle;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use reqwest::{Client, header};
 use serde_json::{Value, json};
 use serde::{Serialize, Deserialize};
@@ -27,17 +30,17 @@ pub enum RepoStatus {
 pub struct File {
     pub name: String,
     pub api: String,
-    pub sha: String,
     pub size: u64,
     pub ino: u64,
-    pub data: Vec<u8>,
+    pub tmp_file: Option<String>,
+    pub cnk_id: u64,
     pub sync: bool,          // if created and not synced with github database
 }
 
 pub struct Github {
     pub username: String,
     pub client: Client,
-    pub cache: Option<HashMap<Repo, Vec<File>>>,
+    pub cache: Option<HashMap<Repo, Vec<Vec<File>>>>,
     pub name: String,
     pub email: String,
 }
@@ -110,7 +113,13 @@ impl Github {
         found_repos
     }
 
-    pub async fn files_in_repo(&self, repo: &str, branch: Option<&str>) -> Vec<File> {
+    /*
+     * RETURN
+     * [ [file.txt -> 0, file.txt -> 1 ] ,
+     *   [file1.txt -> 0, file1.txt -> 1 ] ,
+     *  ]
+     * */
+    pub async fn files_in_repo(&self, repo: &str, branch: Option<&str>) -> Vec<Vec<File>> {
         let api: String = format!(
             "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
             self.username,
@@ -129,29 +138,40 @@ impl Github {
         let tree = json["tree"].as_array().unwrap();
         let mut files: Vec<File> = Vec::new();
 
+        let mut chunked_file_map: HashMap<String, Vec<File>> = HashMap::new();
+
         for file in tree {
             if file.get("type").and_then(|v| v.as_str()) == Some("blob") {
                 let name = file.get("path").and_then(|x| x.as_str()).unwrap().to_string();
+                let (stem, file_name, cnk_id) = file_metadata(&name).expect("Error"); // Stem: folder/	Name: file.txt	Id: 1
                 let url = format!(
                     "https://raw.githubusercontent.com/{}/{}/main/{}",
                         self.username, repo, name
                     );
-                let sha = file.get("sha").and_then(|x| x.as_str()).unwrap().to_string();
                 let size = file.get("size").and_then(|x| Some(x.as_u64().expect("Error parsing"))).expect("Error parsing!");
-                files.push(File {
-                    name: name,
+
+                let current_file = File {
+                    name: format!("{}{}", stem, file_name),
                     api: url,
-                    sha: sha,
                     size: size,
                     ino: CURRENT_INO.load(Ordering::SeqCst),
-                    data: Vec::new(),
+                    tmp_file: None,
+                    cnk_id: cnk_id,
                     sync: true,
-                });
+                };
+
                 CURRENT_INO.fetch_add(1, Ordering::SeqCst);
+
+                chunked_file_map
+                    .entry(current_file.name.clone())
+                    .or_insert_with(|| Vec::new())
+                    .push(current_file);
             }
         }
 
-        files
+        chunked_file_map
+            .into_values()
+            .collect()
     }
 
     pub async fn cache_files(&mut self) -> Result<()> {
@@ -212,13 +232,178 @@ impl Github {
         false
     }
 
-    pub async fn upload_file(&mut self, old_file: Option<File>, content: &str) -> bool {
-        // if old_file is none then is just wants to create a file
-        false
+    pub async fn get_suitable_repo(&self, size: u64) -> Option<Repo> {
+        let repos: Vec<&Repo> = self.cache
+            .as_ref()
+            .expect("Error: No cached saved!")
+            .keys()
+            .map(|f| f)
+            .collect();
+
+        for repo in repos {
+            if let RepoStatus::Active(left_size) = repo.filled {
+                if left_size > size {
+                    return Some(repo.clone());
+                }
+            }
+        }
+
+        None
     }
 
-    pub async fn download_file(&self, file: &str) -> String {
-        "".to_string()
+    pub async fn upload_file(&mut self, file: std::result::Result<File, String>, content: &[u8]) -> bool {
+        let file_size = match file {
+            Ok(ref file) => file.size,
+            Err(_) => content.len() as u64
+        };
+
+        let chunks: Vec<&[u8]> = content
+            .chunks(FILE_SIZE_LIMIT as usize)
+            .clone()
+            .collect();
+
+        let file_name = match file {
+            Ok(ref file) => file.name.clone(),
+            Err(ref file_nm) => file_nm.clone()
+        };
+
+        let mut start_chunk_id: u64 = match file {
+            Ok(ref file) => {
+                let a = self.cache
+                    .as_ref()
+                    .expect("No cache")
+                    .values()
+                    .flat_map(|cnk| cnk.iter())
+                    .find(|cache| !cache.is_empty() && cache[0].name == file.name);
+
+                match a.expect("File sent in func but doesnt exists in cache!").last() {
+                    Some(x) => x.cnk_id + 1,
+                    None => 0
+                }
+            },
+            Err(_) => 0 // creating a file
+        };
+
+        let tmp_file_name = match file {
+            Ok(ref file) => file.tmp_file.clone().unwrap_or(format!("/tmp/FS/{}", file.name)),
+            Err(ref name) => format!("/tmp/FS/{}", name)
+        };
+
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create(true)
+            .open(&tmp_file_name)
+            .expect("Error tmp file opening");
+
+        let mut body = json!({
+            "message" : format!("Updating file {}", file_name),
+            "committer" : {
+                "name" : self.name,
+                "email" : self.email
+            },
+
+        });
+
+        for chunk in chunks {
+            let chunk_name = format!("{}/{}_chunk_{}", file_name, file_name, start_chunk_id);
+            let req_repo = self.get_suitable_repo(chunk.len() as u64).await.expect("error creating repo!");
+            let api = format!(
+                "https://api.github.com/repos/{}/{}/contents/{}",
+                self.username, req_repo.name, chunk_name);
+
+            body["content"] = general_purpose::STANDARD.encode(chunk).into();
+
+            let resp = self.client
+                .put(&api)
+                .json(&body)
+                .send()
+                .await.expect("Error sending request");
+
+            if !resp.status().is_success() {
+                eprintln!("API Error: {}: {}", resp.status(), resp.text().await.unwrap());
+                return false;
+            }
+
+            let resp = resp
+                .text()
+                .await.expect("Error getting text");
+
+            let resp_json = serde_json::from_str::<serde_json::Value>(&resp)
+                .expect("Error: Deserializing");
+
+            let file_chunk = File {
+                name: chunk_name,
+                api: api,
+                size: chunk.len() as u64,
+                ino: CURRENT_INO.load(Ordering::SeqCst),
+                tmp_file: Some(tmp_file_name.clone()),
+                cnk_id: start_chunk_id,
+                sync: true
+            };
+
+            self.cache
+                .as_mut()
+                .expect("Error: No cache saved")
+                .entry(req_repo.clone())
+                .or_insert_with(|| Vec::new())
+                .push(vec![file_chunk]);
+
+            start_chunk_id += 1;
+
+            tmp_file.write_all(chunk).expect("Error writting to file!");
+        }
+
+        true
+    }
+
+    pub async fn download_file(&mut self, needle: &str) -> Option<String> {
+        let cnk_file_format = format!("{}/{}_chunk_", needle, needle);
+
+        let mut found_chunks: Vec<&mut Vec<File>> = self.cache
+            .as_mut()
+            .expect("Error no cache saved!")
+            .values_mut()
+            .flat_map(|file| file.iter_mut())
+            .filter(|file| {
+                file.first().map_or(false, |f|
+                    f.name == needle || f.name.starts_with(&cnk_file_format)
+                )
+            })
+            .collect();
+
+        if found_chunks.is_empty() {
+            return None;
+        }
+
+        let tmp_file_name = format!("/tmp/FS/{}", needle);
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create(true)
+            .open(&tmp_file_name)
+            .expect("Error tmp file opening");
+
+        for file_chunk in found_chunks {
+            for chunk in file_chunk.iter_mut() {
+                if chunk.tmp_file.is_some() {
+                    continue;
+                }
+
+                let body = self.client
+                    .get(&chunk.api)
+                    .send()
+                    .await.unwrap()
+                    .text()
+                    .await.unwrap()
+                    .into_bytes();
+
+                tmp_file.write_all(&body).expect("Error writting to file!");
+                chunk.tmp_file = Some(tmp_file_name.clone());
+            }
+        }
+
+        Some(tmp_file_name)
     }
 
 }
@@ -351,4 +536,28 @@ fn read_file(file: &str) -> Vec<u8>{
     };
 
     encrypt_content(data, vec![])
+}
+
+fn file_metadata(file: &str) -> Option<(String, String, u64)> {
+    let path = Path::new(&file).parent().unwrap();
+
+    let file_stem = path
+        .parent()
+        .map(|p| format!("{}/", p.to_string_lossy()))
+        .unwrap_or_else(|| "".to_string());
+
+    let file_name = path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let cnk_id: u64 = file
+        .rsplit("_chunk_")
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    Some((file_stem, file_name, cnk_id))
 }
