@@ -1,7 +1,6 @@
 #![allow(unused)]
 use fuser::FUSE_ROOT_ID;
-use std::io::{Error, IsTerminal, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::Write;
 use tokio::runtime::Handle;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::Path;
@@ -9,12 +8,12 @@ use reqwest::{Client, header};
 use serde_json::{Value, json};
 use serde::{Serialize, Deserialize};
 use base64::{engine::general_purpose, prelude::*};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Result;
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Repo {
+    pub id: u64,
     pub name: String,
     pub size: u64,
     pub filled: RepoStatus,
@@ -47,7 +46,7 @@ pub struct Github {
 
 static CURRENT_INO: AtomicU64 = AtomicU64::new(FUSE_ROOT_ID + 1);
 const REPO_SIZE_LIMIT: u64 = 100 * 1024; // in KB
-const FILE_SIZE_LIMIT: u64 = 0; // in KB
+const FILE_SIZE_LIMIT: u64 = 75 * 1024 * 1024; // in mb
 
 impl Github {
     pub fn new(token: &str, username: &str) -> Github {
@@ -104,6 +103,7 @@ impl Github {
             let name = repo.get("name").unwrap().to_string().trim_matches('"').to_string();
             let size = repo["size"].as_u64().unwrap_or(0);
             found_repos.push(Repo {
+                id: name.rsplit('_').next().expect("Error after splitting").parse().expect("Error: parsing the number"),
                 name: name,
                 size: size,
                 filled: if size >= REPO_SIZE_LIMIT { RepoStatus::Sealed } else { RepoStatus::Active(REPO_SIZE_LIMIT - size) } // size left
@@ -113,12 +113,6 @@ impl Github {
         found_repos
     }
 
-    /*
-     * RETURN
-     * [ [file.txt -> 0, file.txt -> 1 ] ,
-     *   [file1.txt -> 0, file1.txt -> 1 ] ,
-     *  ]
-     * */
     pub async fn files_in_repo(&self, repo: &str, branch: Option<&str>) -> Vec<Vec<File>> {
         let api: String = format!(
             "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
@@ -136,14 +130,13 @@ impl Github {
 
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let tree = json["tree"].as_array().unwrap();
-        let mut files: Vec<File> = Vec::new();
 
         let mut chunked_file_map: HashMap<String, Vec<File>> = HashMap::new();
 
         for file in tree {
             if file.get("type").and_then(|v| v.as_str()) == Some("blob") {
                 let name = file.get("path").and_then(|x| x.as_str()).unwrap().to_string();
-                let (stem, file_name, cnk_id) = file_metadata(&name).expect("Error"); // Stem: folder/	Name: file.txt	Id: 1
+                let (stem, file_name, cnk_id) = file_metadata(&name).expect("Error");
                 let url = format!(
                     "https://raw.githubusercontent.com/{}/{}/main/{}",
                         self.username, repo, name
@@ -215,6 +208,7 @@ impl Github {
                 .expect("'size' key missing!");
 
         let repo = Repo {
+            id: repo.rsplit('_').next().expect("Error after splitting").parse().expect("Error: parsing the number"),
             name: repo.to_string(),
             size: repo_size,
             filled: if repo_size >= REPO_SIZE_LIMIT { RepoStatus::Sealed } else { RepoStatus::Active(REPO_SIZE_LIMIT - repo_size) },
@@ -228,19 +222,24 @@ impl Github {
         Some(repo)
     }
 
-    pub async fn delete_file(&mut self, file: &str) -> bool {
+    pub async fn delete_file(&mut self, _file: &str) -> bool {
         false
     }
 
-    pub async fn get_suitable_repo(&self, size: u64) -> Option<Repo> {
-        let repos: Vec<&Repo> = self.cache
+    pub async fn get_suitable_repo(&mut self, size: u64) -> Option<Repo> {
+        let repos: Vec<Repo> = self.cache
             .as_ref()
             .expect("Error: No cached saved!")
             .keys()
-            .map(|f| f)
+            .map(|f| f.clone())
             .collect();
 
+
+        let mut next_id = 0;
+
         for repo in repos {
+            next_id = repo.id;
+            // increase repo size after inserting file in upload
             if let RepoStatus::Active(left_size) = repo.filled {
                 if left_size > size {
                     return Some(repo.clone());
@@ -248,15 +247,10 @@ impl Github {
             }
         }
 
-        None
+        return self.create_repo(&format!("repo_{}", next_id + 1)).await;
     }
 
-    pub async fn upload_file(&mut self, file: std::result::Result<File, String>, content: &[u8]) -> bool {
-        let file_size = match file {
-            Ok(ref file) => file.size,
-            Err(_) => content.len() as u64
-        };
-
+    pub async fn upload_file(&mut self, file: std::result::Result<&File, String>, content: &[u8], tmp_file_name: Option<String>) -> bool {
         let chunks: Vec<&[u8]> = content
             .chunks(FILE_SIZE_LIMIT as usize)
             .clone()
@@ -281,20 +275,8 @@ impl Github {
                     None => 0
                 }
             },
-            Err(_) => 0 // creating a file
+            Err(_) => 0,  // creating a file
         };
-
-        let tmp_file_name = match file {
-            Ok(ref file) => file.tmp_file.clone().unwrap_or(format!("/tmp/FS/{}", file.name)),
-            Err(ref name) => format!("/tmp/FS/{}", name)
-        };
-
-        let mut tmp_file = std::fs::OpenOptions::new()
-            .write(true)
-            .append(true)
-            .create(true)
-            .open(&tmp_file_name)
-            .expect("Error tmp file opening");
 
         let mut body = json!({
             "message" : format!("Updating file {}", file_name),
@@ -329,15 +311,15 @@ impl Github {
                 .text()
                 .await.expect("Error getting text");
 
-            let resp_json = serde_json::from_str::<serde_json::Value>(&resp)
-                .expect("Error: Deserializing");
+            let _resp_json = serde_json::from_str::<serde_json::Value>(&resp)
+                .expect("Error: Deserializing"); // remove
 
             let file_chunk = File {
                 name: chunk_name,
                 api: api,
                 size: chunk.len() as u64,
                 ino: CURRENT_INO.load(Ordering::SeqCst),
-                tmp_file: Some(tmp_file_name.clone()),
+                tmp_file: tmp_file_name.clone(),
                 cnk_id: start_chunk_id,
                 sync: true
             };
@@ -350,8 +332,6 @@ impl Github {
                 .push(vec![file_chunk]);
 
             start_chunk_id += 1;
-
-            tmp_file.write_all(chunk).expect("Error writting to file!");
         }
 
         true
@@ -360,7 +340,7 @@ impl Github {
     pub async fn download_file(&mut self, needle: &str) -> Option<String> {
         let cnk_file_format = format!("{}/{}_chunk_", needle, needle);
 
-        let mut found_chunks: Vec<&mut Vec<File>> = self.cache
+        let found_chunks: Vec<&mut Vec<File>> = self.cache
             .as_mut()
             .expect("Error no cache saved!")
             .values_mut()
@@ -406,6 +386,7 @@ impl Github {
         Some(tmp_file_name)
     }
 
+    pub async fn sync_files(&self) {}
 }
 
 pub enum FileType {
@@ -420,21 +401,30 @@ pub struct Node {
     pub parent: u64,
 }
 
+#[derive(Clone)]
+pub struct FileHandleData {
+    pub logical_name: String,
+    pub tmp_path: Option<String>,
+    pub is_dirty: bool,
+    pub size: u64,
+}
+
 pub struct FileTree {
     pub nodes: HashMap<u64, Node>,
     pub root: u64,
     pub next_ino: u64,
-    pub github: Option<Github>,
-    pub handle: Handle
+    pub github: Github,
+    pub handle: Handle,
 }
 
+
 impl FileTree {
-    pub fn new(files: Vec<File>, handle: Handle) -> Self {
+    pub fn new(gh: Github, handle: Handle) -> Self {
         let mut fs = FileTree {
             nodes: HashMap::new(),
             root: FUSE_ROOT_ID,
             next_ino: FUSE_ROOT_ID + 1,
-            github: None,
+            github: gh,
             handle: handle
         };
 
@@ -445,7 +435,30 @@ impl FileTree {
             parent: FUSE_ROOT_ID
         });
 
-        for file in files {
+        let logical_files: Vec<File> = {
+            let cache = fs.github.cache.as_ref().expect("error no cache");
+
+            cache
+                .values()
+                .flat_map(|groups| groups.iter())
+                .filter(|chunks| !chunks.is_empty())
+                .map(|chunk| {
+                    let chunk = &chunk[0];
+
+                    let logical_path = chunk
+                        .name
+                        .rsplit_once('/')
+                        .map(|(p,_)| p)
+                        .expect("Invalid chunk path format");
+
+                    let mut f = chunk.clone();
+                    f.name = logical_path.to_string();
+                    f
+                })
+            .collect()
+        };
+
+        for file in logical_files {
             fs.insert_path(file);
         }
 
@@ -458,18 +471,20 @@ impl FileTree {
         ino
     }
 
-    pub fn insert_path(&mut self, file: File) {
+    fn insert_path(&mut self, file: File) {
         let mut current = self.root;
-        let path = &file.name;
-
-        let parts: Vec<&str> = path.split("/").collect();
+        let parts: Vec<&str> = file
+            .name
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .collect();
 
         for (i, part) in parts.iter().enumerate() {
             let is_last = i == parts.len() - 1;
 
             let next = match &self.nodes[&current].kind {
                 FileType::Dir(children) => children.get(*part).copied(),
-                _ => unreachable!()
+                _ => unreachable!("Parent is not a directory"),
             };
 
             current = match next {
@@ -502,7 +517,7 @@ impl FileTree {
     }
 }
 
-fn encrypt_content(data: Vec<u8>, key: Vec<u8>) -> Vec<u8> {
+fn encrypt_content(data: Vec<u8>, _key: Vec<u8>) -> Vec<u8> {
     /*
      * implement later
      * generate nonce
@@ -511,7 +526,7 @@ fn encrypt_content(data: Vec<u8>, key: Vec<u8>) -> Vec<u8> {
     data
 }
 
-fn decrypt_content(data: &str) -> Vec<u8> {
+fn decrypt_content(_data: &str) -> Vec<u8> {
     /*
      * Data = nonce + data
      * if in chunks

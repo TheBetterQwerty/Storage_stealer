@@ -22,15 +22,7 @@ fn main() {
         github.cache_files().await.unwrap();
     });
 
-    let files: Vec<_> = github.cache.as_ref()
-            .expect("Error: getting values")
-            .values()
-            .flat_map(|s| s.clone())
-            .collect();
-
-
-    let mut fs = github::FileTree::new(files, rt.handle().clone());
-    fs.github = Some(github);
+    let fs = github::FileTree::new(github, rt.handle().clone());
 
     println!("Before fuser");
 

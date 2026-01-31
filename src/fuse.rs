@@ -2,7 +2,8 @@ use crate::github::{ FileTree, FileType, Node };
 use fuser::{
     ReplyAttr, FileAttr, Filesystem, ReplyDirectory, ReplyEntry, Request, FileType as FuserFileType
 };
-use libc::ENOENT;
+use libc::{EIO, EISDIR, ENOENT};
+use std::io::{Seek, SeekFrom, Write};
 use std::time::{Duration, SystemTime};
 use std::ffi::OsStr;
 
@@ -123,9 +124,18 @@ impl Filesystem for FileTree {
             FileType::Dir(_) => return reply.error(ENOENT)
         };
 
-        let data = self.handle.block_on(
-            // function returns the name of file
-        );
+        let data = match &file.tmp_file {
+            Some(tmp_file) => {
+                std::fs::read(tmp_file).expect("error: reading file")
+            },
+            None => {
+                let tmp_file = self.handle.block_on(async {
+                   self.github.download_file(&file.name).await
+                });
+
+                std::fs::read(tmp_file.expect("File not downloaded!")).expect("error: reading file")
+            },
+        };
 
         let offset = offset as usize;
         if offset >= data.len() {
@@ -134,5 +144,53 @@ impl Filesystem for FileTree {
 
         let end = std::cmp::min(offset + size as usize, data.len());
         reply.data(&data[offset..end]);
+    }
+
+    fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: fuser::ReplyWrite) {
+
+        let node = match self.nodes.get(&ino) {
+            Some(x) => x,
+            None => return reply.error(ENOENT)
+        };
+
+        let file = match &node.kind {
+            FileType::File(f) => f,
+            FileType::Dir(_) => return reply.error(EISDIR),
+        };
+
+        let tmp_path = match &file.tmp_file {
+            Some(p) => p.clone(),
+            None => return reply.error(EIO),
+        };
+
+        let mut f = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&tmp_path)
+        {
+            Ok(f) => f,
+            Err(_) => return reply.error(EIO)
+        };
+
+        if offset < 0 {
+            return reply.error(EIO);
+        }
+
+        if f.seek(SeekFrom::Start(offset as u64)).is_err() {
+            return reply.error(EIO);
+        }
+
+        if f.write_all(data).is_err() {
+            return reply.error(EIO);
+        }
+
+        if let false = self.handle.block_on(async {
+            self.github.upload_file(Ok(file), data, Some(tmp_path)).await
+        }) {
+            return reply.error(EIO);
+        }
+
+        reply.written(data.len() as u32);
     }
 }
