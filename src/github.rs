@@ -5,7 +5,7 @@ use tokio::runtime::Handle;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::Path;
 use reqwest::{Client, header};
-use serde_json::{Value, json};
+use serde_json::json;
 use serde::{Serialize, Deserialize};
 use base64::{engine::general_purpose, prelude::*};
 use std::collections::HashMap;
@@ -389,11 +389,13 @@ impl Github {
     pub async fn sync_files(&self) {}
 }
 
+#[derive(Clone)]
 pub enum FileType {
     File(File),
     Dir(HashMap<String, u64>)
 }
 
+#[derive(Clone)]
 pub struct Node {
     pub ino: u64,
     pub name: String,
@@ -415,6 +417,7 @@ pub struct FileTree {
     pub next_ino: u64,
     pub github: Github,
     pub handle: Handle,
+    pub offset: Option<u64>
 }
 
 
@@ -425,7 +428,8 @@ impl FileTree {
             root: FUSE_ROOT_ID,
             next_ino: FUSE_ROOT_ID + 1,
             github: gh,
-            handle: handle
+            handle: handle,
+            offset: None
         };
 
         fs.nodes.insert(FUSE_ROOT_ID, Node {
@@ -465,7 +469,7 @@ impl FileTree {
         fs
     }
 
-    fn alloc_ino(&mut self) -> u64 {
+    pub fn alloc_ino(&mut self) -> u64 {
         let ino = self.next_ino;
         self.next_ino += 1;
         ino

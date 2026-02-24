@@ -6,6 +6,7 @@ use libc::{EIO, EISDIR, ENOENT};
 use std::io::{Seek, SeekFrom, Write};
 use std::time::{Duration, SystemTime};
 use std::ffi::OsStr;
+use crate::github::File;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -163,6 +164,8 @@ impl Filesystem for FileTree {
             None => return reply.error(EIO),
         };
 
+        dbg!(&tmp_path);
+
         let mut f = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -170,7 +173,10 @@ impl Filesystem for FileTree {
             .open(&tmp_path)
         {
             Ok(f) => f,
-            Err(_) => return reply.error(EIO)
+            Err(e) => {
+                dbg!(e);
+                return reply.error(EIO);
+            }
         };
 
         if offset < 0 {
@@ -185,12 +191,39 @@ impl Filesystem for FileTree {
             return reply.error(EIO);
         }
 
-        if let false = self.handle.block_on(async {
-            self.github.upload_file(Ok(file), data, Some(tmp_path)).await
-        }) {
-            return reply.error(EIO);
-        }
+        self.offset = Some(offset as u64);
 
         reply.written(data.len() as u32);
+    }
+
+    fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
+        let filename = name.to_str().unwrap().to_string();
+
+        let ino = self.alloc_ino();
+
+        let file = File {
+            name: filename.clone(),
+            api: String::new(),
+            size: 0,
+            ino: ino,
+            tmp_file: Some(format!("/tmp/FS/{}", filename)),
+            cnk_id: 0,
+            sync: false
+        };
+
+        let node = Node {
+            ino,
+            name: file.name.clone(),
+            kind: FileType::File(file),
+            parent
+        };
+
+        self.nodes.insert(ino, node.clone());
+
+        reply.created(&TTL, &node_to_attr(&node), 0, 0, 0);
+    }
+
+    fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: fuser::ReplyEmpty) {
+
     }
 }
