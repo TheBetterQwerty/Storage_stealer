@@ -1,6 +1,7 @@
 #![allow(unused)]
 use fuser::FUSE_ROOT_ID;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use tokio::runtime::Handle;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::Path;
@@ -250,13 +251,22 @@ impl Github {
         return self.create_repo(&format!("repo_{}", next_id + 1)).await;
     }
 
-    pub async fn upload_file(&mut self, file: std::result::Result<&File, String>, content: &[u8], tmp_file_name: Option<String>) -> bool {
+    pub async fn upload_file(&mut self, file: String) -> bool {
+        let mut content = Vec::new();
+
+        if let Err(err) = File::open(&file)
+            .expect("[!] Error: Opening file")
+            .read_to_end(&mut content) {
+                eprintln!("[!] Error: {err}");
+                return false;
+        }
+
         let chunks: Vec<&[u8]> = content
             .chunks(FILE_SIZE_LIMIT as usize)
             .clone()
             .collect();
 
-        let file_name = match file {
+        /*let file_name = match file {
             Ok(ref file) => file.name.clone(),
             Err(ref file_nm) => file_nm.clone()
         };
@@ -276,10 +286,12 @@ impl Github {
                 }
             },
             Err(_) => 0,  // creating a file
-        };
+        }; */
+
+        let mut start_chunk_id = 0;
 
         let mut body = json!({
-            "message" : format!("Updating file {}", file_name),
+            "message" : format!("Updating file {}", file),
             "committer" : {
                 "name" : self.name,
                 "email" : self.email
@@ -288,7 +300,7 @@ impl Github {
         });
 
         for chunk in chunks {
-            let chunk_name = format!("{}/{}_chunk_{}", file_name, file_name, start_chunk_id);
+            let chunk_name = format!("{}/{}_chunk_{}", file, file, start_chunk_id);
             let req_repo = self.get_suitable_repo(chunk.len() as u64).await.expect("error creating repo!");
             let api = format!(
                 "https://api.github.com/repos/{}/{}/contents/{}",
