@@ -2,6 +2,7 @@ use std::env::args;
 
 mod github;
 mod fuse;
+mod sender;
 
 fn handle_download() {}
 
