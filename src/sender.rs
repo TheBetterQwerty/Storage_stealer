@@ -1,12 +1,10 @@
-// Main Function calls get_repos().await on startup
-
 use base64::Engine;
 use base64::engine::general_purpose;
 use reqwest::{Client, header};
 use serde::{Serialize, Deserialize};
 use serde_json::json;
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::collections::HashMap;
 
@@ -28,6 +26,7 @@ pub struct FileStruct {
     pub name: String,
     pub api: String,
     pub size: u64,
+    pub sha: String,
     pub chunk_id: u64
 }
 
@@ -133,11 +132,13 @@ impl Github {
                     self.username, repo, name
                 );
                 let size = file.get("size").and_then(|x| Some(x.as_u64().expect("Error parsing"))).expect("Error parsing!");
+                let sha = file.get("sha").and_then(|x| x.as_str()).unwrap().to_string();
 
                 let current_file = FileStruct {
                     name: format!("{}{}", stem, file_name),
                     api: url,
                     size: size,
+                    sha: sha,
                     chunk_id: cnk_id,
                 };
 
@@ -191,7 +192,7 @@ impl Github {
 
     pub async fn get_suitable_repo(&mut self, file_size: u64) -> Option<usize> {
         for (idx, repo) in self.repos.iter().enumerate() {
-            if let RepoStatus::Active(size_left) = repo.filled {
+            if let RepoStatus::Active(size_left) = repo.get_size() {
                 if size_left > file_size {
                     return Some(idx);
                 }
@@ -208,13 +209,12 @@ impl Github {
         }
     }
 
+    /*
+     * User sends a file
+     * Open it get data
+     * chunk it into 75KB chunks base64 encode chunks and upload it
+     * */
     pub async fn upload_file(&mut self, file_name: &str) {
-        /*
-         * User sends a file
-         * Open it get data
-         * chunk it into 75KB chunks base64 encode chunks and upload it
-         * */
-
         let mut content = Vec::new();
 
         if let Err(err) = File::open(&file_name)
@@ -229,7 +229,6 @@ impl Github {
         let total_chunks_len = chunks.len();
 
         let mut start_chunk_id = 0;
-
         let mut body = json!({
             "message" : format!("Uploading file {}", file_name),
             "committer" : {
@@ -240,13 +239,14 @@ impl Github {
 
         for chunk in chunks {
             let chunk_name = format!("{}/{}_chunk_{}", file_name, file_name, start_chunk_id);
-            let repo = self.get_suitable_repo(chunk.len() as u64)
+            let chunk_len = chunk.len() as u64;
+            let repo_idx = self.get_suitable_repo(chunk_len)
                 .await
                 .expect("Error: Finding or creating a repo");
 
             let api = format!(
                 "https://api.github.com/repos/{}/{}/contents/{}",
-                self.username, repo.name, chunk_name
+                self.username, self.repos[repo_idx].name, chunk_name
             );
 
             body["content"] = general_purpose::STANDARD.encode(chunk).into();
@@ -266,13 +266,124 @@ impl Github {
             }
 
             start_chunk_id += 1;
+            self.repos[repo_idx].set_size(chunk_len);
             println!("[API] UPLOADED FILE CHUNKED {}/{}", start_chunk_id, total_chunks_len);
         }
     }
 
-    pub fn delete_file(&self) {}
+    pub async fn delete_file(&mut self, required_file: &str) {
+        let message = "Commiting to delete the file";
 
-    pub fn download_file(&self) {}
+        // Repos already setup
+        let mut filesystem = HashMap::new();
+
+        for repo in &self.repos {
+            filesystem.insert(repo, self.files_in_repo(&repo.name, None).await);
+        }
+
+        let mut body = json!({
+            "message" : message,
+            "committer" : {
+                "name" : self.name,
+                "email" : self.email,
+            },
+        });
+
+        for (repo, files_in_repo) in filesystem {
+            for (file_name, file_chunks) in files_in_repo {
+                if !file_name.eq(required_file) {
+                    continue;
+                }
+
+                let (mut start_idx, end_idx) = (0, file_chunks.len());
+
+                // Create the delete request
+                for chunk in file_chunks {
+                    let api = format!("https://api.github.com/repos/{}/{}/contents/{}",
+                        self.username, repo.name, chunk.name
+                    );
+
+                    body["sha"] = chunk.sha.into();
+
+                    let resp = self.client
+                        .delete(&api)
+                        .json(&body)
+                        .send()
+                        .await.unwrap();
+
+                    if !resp.status().is_success() {
+                        eprintln!("[ERROR] Deleting file chunk");
+                        return;
+                    }
+
+                    start_idx += 1;
+                    println!("[API] Deleting File Chunk {}/{}", start_idx, end_idx);
+                }
+            }
+        }
+    }
+
+    pub async fn download_file(&self, required_file: &str, output_file: &str) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(output_file)
+            .expect("Error: Opening file");
+
+        let mut filesystem = Vec::new();
+
+        for repo in &self.repos {
+            filesystem.push(self.files_in_repo(&repo.name, None).await);
+        }
+
+
+        for files_in_repo in filesystem {
+            for (file_name, file_chunks) in files_in_repo {
+                if !file_name.eq(required_file) {
+                    continue;
+                }
+
+                let (mut start_idx, end_idx) = (0, file_chunks.len());
+
+                for chunk in file_chunks {
+                    let resp = self.client
+                        .get(&chunk.api)
+                        .send()
+                        .await.unwrap();
+
+                    if !resp.status().is_success() {
+                        println!("[ERROR] Downloading Chunk");
+                        break;
+                    }
+
+                    let data = resp.text().await.unwrap();
+                    if let Err(err) = file.write_all(data.as_bytes()) {
+                        eprintln!("[ERROR] Writting to file: {err}");
+                        break;
+                    } else {
+                        start_idx += 1;
+                        println!("[API] Written files chunks {}/{}", start_idx, end_idx);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Repo {
+    fn set_size(&mut self, size: u64) {
+        if let RepoStatus::Active(size_left) = self.filled {
+            if size_left - size <= 0 {
+                self.filled = RepoStatus::Sealed;
+                return;
+            }
+
+            self.filled = RepoStatus::Active(size_left - size);
+        }
+    }
+
+    fn get_size(&self) -> RepoStatus {
+        self.filled.clone()
+    }
 }
 
 fn file_metadata(file: &str) -> Option<(String, String, u64)> {
