@@ -22,9 +22,12 @@ pub enum RepoStatus {
     Sealed,
 }
 
+#[allow(unused)]
+#[derive(Debug)]
 pub struct FileStruct {
     pub name: String,
     pub api: String,
+    pub repo: String,
     pub size: u64,
     pub sha: String,
     pub chunk_id: u64
@@ -119,7 +122,7 @@ impl Github {
             .await.unwrap();
 
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let tree = json["tree"].as_array().unwrap();
+        let tree = json["tree"].as_array().expect("err unwraping");
 
         let mut chunked_file_map: HashMap<String, Vec<FileStruct>> = HashMap::new();
 
@@ -137,6 +140,7 @@ impl Github {
                 let current_file = FileStruct {
                     name: format!("{}{}", stem, file_name),
                     api: url,
+                    repo: repo.to_string(),
                     size: size,
                     sha: sha,
                     chunk_id: cnk_id,
@@ -271,16 +275,8 @@ impl Github {
         }
     }
 
-    pub async fn delete_file(&mut self, required_file: &str) {
+    pub async fn delete_file(&mut self, file_chunks: &Vec<FileStruct>) {
         let message = "Commiting to delete the file";
-
-        // Repos already setup
-        let mut filesystem = HashMap::new();
-
-        for repo in &self.repos {
-            filesystem.insert(repo, self.files_in_repo(&repo.name, None).await);
-        }
-
         let mut body = json!({
             "message" : message,
             "committer" : {
@@ -289,83 +285,70 @@ impl Github {
             },
         });
 
-        for (repo, files_in_repo) in filesystem {
-            for (file_name, file_chunks) in files_in_repo {
-                if !file_name.eq(required_file) {
-                    continue;
-                }
+        let (mut start_idx, end_idx) = (0, file_chunks.len());
 
-                let (mut start_idx, end_idx) = (0, file_chunks.len());
+        dbg!(&file_chunks);
 
-                // Create the delete request
-                for chunk in file_chunks {
-                    let api = format!("https://api.github.com/repos/{}/{}/contents/{}",
-                        self.username, repo.name, chunk.name
-                    );
+        for chunk in file_chunks {
+            let cnk_name = chunk.name.strip_prefix('/').unwrap_or(&chunk.name);
+            let api = format!("https://api.github.com/repos/{}/{}/contents/{}/{}",
+                self.username, chunk.repo,
+                cnk_name,
+                format!("{}_chunk_{}", cnk_name, chunk.chunk_id)
+            );
 
-                    body["sha"] = chunk.sha.into();
+            dbg!(&api);
 
-                    let resp = self.client
-                        .delete(&api)
-                        .json(&body)
-                        .send()
-                        .await.unwrap();
+            body["sha"] = chunk.sha.clone().into();
 
-                    if !resp.status().is_success() {
-                        eprintln!("[ERROR] Deleting file chunk");
-                        return;
-                    }
+            let resp = self.client
+                .delete(&api)
+                .json(&body)
+                .send()
+                .await.unwrap();
 
-                    start_idx += 1;
-                    println!("[API] Deleting File Chunk {}/{}", start_idx, end_idx);
-                }
+            let status = resp.status();
+            println!("{}", resp.text().await.expect("Error getting text"));
+            if !status.is_success() {
+                eprintln!("[ERROR] Deleting file chunk");
+                return;
             }
+
+            start_idx += 1;
+            println!("[API] Deleting File Chunk {}/{}", start_idx, end_idx);
         }
+
     }
 
-    pub async fn download_file(&self, required_file: &str, output_file: &str) {
+    pub async fn download_file(&self, chunks: &Vec<FileStruct>, output_file: &str) {
         let mut file = OpenOptions::new()
             .write(true)
             .open(output_file)
             .expect("Error: Opening file");
 
-        let mut filesystem = Vec::new();
+        let (mut start_idx, end_idx) = (0, chunks.len());
 
-        for repo in &self.repos {
-            filesystem.push(self.files_in_repo(&repo.name, None).await);
-        }
+        for chunk in chunks {
+            let resp = self.client
+                .get(&chunk.api)
+                .send()
+                .await.unwrap();
 
+            if !resp.status().is_success() {
+                println!("[ERROR] Downloading Chunk");
+                break;
+            }
 
-        for files_in_repo in filesystem {
-            for (file_name, file_chunks) in files_in_repo {
-                if !file_name.eq(required_file) {
-                    continue;
-                }
-
-                let (mut start_idx, end_idx) = (0, file_chunks.len());
-
-                for chunk in file_chunks {
-                    let resp = self.client
-                        .get(&chunk.api)
-                        .send()
-                        .await.unwrap();
-
-                    if !resp.status().is_success() {
-                        println!("[ERROR] Downloading Chunk");
-                        break;
-                    }
-
-                    let data = resp.text().await.unwrap();
-                    if let Err(err) = file.write_all(data.as_bytes()) {
-                        eprintln!("[ERROR] Writting to file: {err}");
-                        break;
-                    } else {
-                        start_idx += 1;
-                        println!("[API] Written files chunks {}/{}", start_idx, end_idx);
-                    }
-                }
+            let data = resp.text().await.unwrap();
+            if let Err(err) = file.write_all(data.as_bytes()) {
+                eprintln!("[ERROR] Writting to file: {err}");
+                break;
+            } else {
+                start_idx += 1;
+                println!("[API] Written files chunks {}/{}", start_idx, end_idx);
             }
         }
+
     }
 }
 
