@@ -7,6 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::collections::HashMap;
+use crate::crypto;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Repo {
@@ -42,7 +43,7 @@ pub struct Github {
 }
 
 const REPO_SIZE_LIMIT: u64 = 100 * 1024; // in KB
-const FILE_SIZE_LIMIT: u64 = 75 * 1024 * 1024; // in mb
+const FILE_SIZE_LIMIT: u64 = (75 * 1024 * 1024) - 28; // in mb
 
 impl Github {
     pub fn new(token: &str, username: &str) -> Github {
@@ -122,7 +123,10 @@ impl Github {
             .await.unwrap();
 
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let tree = json["tree"].as_array().expect("err unwraping");
+        let tree = match json.get("tree").and_then(|x| x.as_array()) {
+            Some(x) => x,
+            None => return HashMap::new()
+        };
 
         let mut chunked_file_map: HashMap<String, Vec<FileStruct>> = HashMap::new();
 
@@ -228,8 +232,24 @@ impl Github {
             return;
         }
 
+
+        let file_name = {
+            let path = Path::new(file_name);
+            path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        };
+
+        let password = crypto::hash256(
+            &rpassword::prompt_password("[#] Enter your password: ")
+                .expect("[!] Error: taking password from stdin")
+            );
+
         let chunks = content
             .chunks(FILE_SIZE_LIMIT as usize);
+
         let total_chunks_len = chunks.len();
 
         let mut start_chunk_id = 0;
@@ -243,8 +263,22 @@ impl Github {
 
         for chunk in chunks {
             let chunk_name = format!("{}/{}_chunk_{}", file_name, file_name, start_chunk_id);
-            let chunk_len = chunk.len() as u64;
-            let repo_idx = self.get_suitable_repo(chunk_len)
+
+            let nonce: Vec<u8> = (0..12).map(|_| { rand::random::<u8>() }).collect();
+            let mut enc_cnk = Vec::new();
+            enc_cnk.extend_from_slice(&nonce);
+
+            match crypto::encrypt(&password, chunk, &nonce) {
+                Ok(x) => enc_cnk.extend_from_slice(&x),
+                Err(err) => {
+                    eprintln!("[!] Error: Encrypting data: {err}");
+                    return;
+                }
+            }
+
+            let cnk_len = enc_cnk.len() as u64;
+
+            let repo_idx = self.get_suitable_repo(cnk_len)
                 .await
                 .expect("Error: Finding or creating a repo");
 
@@ -253,7 +287,7 @@ impl Github {
                 self.username, self.repos[repo_idx].name, chunk_name
             );
 
-            body["content"] = general_purpose::STANDARD.encode(chunk).into();
+            body["content"] = general_purpose::STANDARD.encode(enc_cnk).into();
 
             let resp = self.client
                 .put(&api)
@@ -270,8 +304,8 @@ impl Github {
             }
 
             start_chunk_id += 1;
-            self.repos[repo_idx].set_size(chunk_len);
-            println!("[API] UPLOADED FILE CHUNKED {}/{}", start_chunk_id, total_chunks_len);
+            self.repos[repo_idx].set_size(cnk_len);
+            println!("[API] UPLOADED FILE CHUNKS {}/{}", start_chunk_id, total_chunks_len);
         }
     }
 
@@ -287,8 +321,6 @@ impl Github {
 
         let (mut start_idx, end_idx) = (0, file_chunks.len());
 
-        dbg!(&file_chunks);
-
         for chunk in file_chunks {
             let cnk_name = chunk.name.strip_prefix('/').unwrap_or(&chunk.name);
             let api = format!("https://api.github.com/repos/{}/{}/contents/{}/{}",
@@ -296,8 +328,6 @@ impl Github {
                 cnk_name,
                 format!("{}_chunk_{}", cnk_name, chunk.chunk_id)
             );
-
-            dbg!(&api);
 
             body["sha"] = chunk.sha.clone().into();
 
@@ -308,14 +338,13 @@ impl Github {
                 .await.unwrap();
 
             let status = resp.status();
-            println!("{}", resp.text().await.expect("Error getting text"));
             if !status.is_success() {
                 eprintln!("[ERROR] Deleting file chunk");
                 return;
             }
 
             start_idx += 1;
-            println!("[API] Deleting File Chunk {}/{}", start_idx, end_idx);
+            println!("[API] Deleted File Chunk {}/{}", start_idx, end_idx);
         }
 
     }
@@ -323,8 +352,12 @@ impl Github {
     pub async fn download_file(&self, chunks: &Vec<FileStruct>, output_file: &str) {
         let mut file = OpenOptions::new()
             .write(true)
+            .create(true)
             .open(output_file)
             .expect("Error: Opening file");
+
+        let password = rpassword::prompt_password("[#] Enter your password: ").expect("[!] Error: taking password from stdin");
+        let password = crypto::hash256(&password);
 
         let (mut start_idx, end_idx) = (0, chunks.len());
 
@@ -339,14 +372,28 @@ impl Github {
                 break;
             }
 
-            let data = resp.text().await.unwrap();
-            if let Err(err) = file.write_all(data.as_bytes()) {
+            let data = resp.bytes().await.unwrap();
+
+            if data.len() < 28usize {                       // Nonce + Tag = 28
+                eprintln!("[ERROR] Writting to file chunk size small");
+                return;
+            }
+
+            let decrypted_data = match crypto::decrypt(&password, &data[12..], &data[..12]) {
+                Ok(x) => x,
+                Err(err) => {
+                    println!("[!] Error: {err}");
+                    return;
+                }
+            };
+
+            if let Err(err) = file.write_all(&decrypted_data) {
                 eprintln!("[ERROR] Writting to file: {err}");
-                break;
             } else {
                 start_idx += 1;
-                println!("[API] Written files chunks {}/{}", start_idx, end_idx);
+                println!("[API] Written file chunks {}/{}", start_idx, end_idx);
             }
+
         }
 
     }

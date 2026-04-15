@@ -4,6 +4,7 @@ use std::env;
 
 use crate::sender::FileStruct;
 
+mod crypto;
 mod argparse;
 mod sender;
 
@@ -38,7 +39,7 @@ async fn main() {
 
             println!("[*] Files in Cloud: ");
             for (index, (file_name, _)) in files.iter().enumerate() {
-                println!("{}.   {}", index, file_name);
+                println!("{}.   {}", index + 1, file_name);
             }
         },
 
@@ -78,7 +79,7 @@ async fn main() {
             }
 
             if confirm.is_none() {
-                let choice = input("[#] Do you wish to delete this file from the cloud ?");
+                let choice = input("[#] Do you wish to delete this file from the cloud ? (Y/n) ");
                 if let Some('n') = choice.to_lowercase().chars().nth(0) {
                     println!("[#] File not deleted");
                     return;
@@ -95,9 +96,6 @@ async fn list_files(github_obj: &sender::Github) -> HashMap<String, Vec<FileStru
     let mut files = HashMap::new();
 
     for repo in &github_obj.repos {
-        if repo.size <= 1 {
-            continue;
-        }
         files.extend(github_obj.files_in_repo(&repo.name, None).await);
     }
 
